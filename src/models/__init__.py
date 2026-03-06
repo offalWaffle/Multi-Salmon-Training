@@ -1,35 +1,20 @@
 """Model architectures."""
 
-from .vae import AudioVAE, Encoder, Decoder
-from .vae_dac import DACVAE, DACEncoder, DACDecoder
-from .conditioned_dac import (
-    ConditionedDAC,
-    FiLMConditionedDAC,
-    create_conditioned_dac,
-    load_pretrained_dac
-)
-
-# Phase 4 models:
-from .diffusion import LatentDiffusion
-from .unet import ConditionalUNet, TimestepEmbedding, ConditionEmbedding
-from .input_encoder import InputSampleEncoder, SimpleInputEncoder
+from .conditioned_dac import ConditionedDAC, FiLMConditionedDAC, create_conditioned_dac, load_pretrained_dac
+from .dac_pitch_adapter import DACPitchAdapter, PitchStripper, PitchInjector
+from .film_layers import FiLM, FiLMConv1d, FiLMResBlock
+from .pitch_conditioning import SinusoidalPitchEmbedding, PitchEmbedding
+from .pitch_adversary import GradientReversal, PitchClassifier
+from .vqvae import VQVAE
+from .quantizers import VectorQuantizer
+from .latent_transformer import LatentTransformer
 
 __all__ = [
-    'AudioVAE',
-    'Encoder',
-    'Decoder',
-    'DACVAE',
-    'DACEncoder',
-    'DACDecoder',
-    'ConditionedDAC',
-    'FiLMConditionedDAC',
-    'create_conditioned_dac',
-    'load_pretrained_dac',
-    # Phase 4:
-    'LatentDiffusion',
-    'ConditionalUNet',
-    'TimestepEmbedding',
-    'ConditionEmbedding',
-    'InputSampleEncoder',
-    'SimpleInputEncoder',
+    'ConditionedDAC', 'FiLMConditionedDAC', 'create_conditioned_dac', 'load_pretrained_dac',
+    'DACPitchAdapter', 'PitchStripper', 'PitchInjector',
+    'FiLM', 'FiLMConv1d', 'FiLMResBlock',
+    'SinusoidalPitchEmbedding', 'PitchEmbedding',
+    'GradientReversal', 'PitchClassifier',
+    'VQVAE', 'VectorQuantizer',
+    'LatentTransformer',
 ]

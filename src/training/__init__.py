@@ -1,9 +1,7 @@
-"""Training loops and loss functions."""
+"""Training loops."""
 
-from .trainer import VAETrainer
-from .losses import vae_loss
+from .vqvae_trainer import VQVAETrainer
+from .transformer_trainer import LatentTransformerTrainer
+from .dac_adapter_trainer import DACAdapterTrainer
 
-__all__ = [
-    'VAETrainer',
-    'vae_loss',
-]
+__all__ = ['VQVAETrainer', 'LatentTransformerTrainer', 'DACAdapterTrainer']
