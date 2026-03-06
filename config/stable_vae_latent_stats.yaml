@@ -1,0 +1,3 @@
+# Stable Audio VAE latent statistics for normalization
+latent_mean: -0.014407
+latent_std: 0.996822

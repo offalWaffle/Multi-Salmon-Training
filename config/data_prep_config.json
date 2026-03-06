@@ -1,0 +1,11 @@
+{
+  "excluded_folders": [
+    "VoxPhrases",
+    "Voco",
+    "drums",
+    "percussion",
+    "fx",
+    "noise"
+  ],
+  "description": "Folders to exclude from preprocessing. Can be absolute paths or folder names to match anywhere in the path."
+}

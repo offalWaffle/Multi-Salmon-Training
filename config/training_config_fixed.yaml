@@ -1,0 +1,26 @@
+training:
+  batch_size: 16
+  num_epochs: 200  # Train longer with better hyperparameters
+  learning_rate: 5e-5  # Lower learning rate for more stable training
+  num_workers: 0  # Keep at 0 for MPS compatibility
+  gradient_accumulation_steps: 1  # Disable for now
+
+  optimizer: "AdamW"
+  weight_decay: 0.01
+  scheduler: "cosine"
+  warmup_steps: 500
+
+  # VAE specific
+  beta: 0.0001  # Start with very low beta
+  beta_annealing: true  # Gradually increase beta
+  beta_final: 4.0  # Target beta value
+  beta_annealing_epochs: 100  # Anneal over 100 epochs
+
+  # Free bits to prevent posterior collapse
+  free_bits: 0.5  # Minimum KL per dimension
+
+  checkpoint_interval: 10
+  validation_interval: 5
+
+device: "mps"
+mixed_precision: false

@@ -1,0 +1,49 @@
+# LatentTransformer training config — VQ-VAE pipeline (Phase 2)
+#
+# Forward pass: VQ-VAE encoder → quantizer → z_q_src
+#               LatentTransformer(z_q_src, target_midi, target_vel) → z_pred
+#               VQ-VAE decoder(z_pred, target_midi) → audio_pred
+# Loss: AudioReconstructionLoss(audio_pred, audio_tgt) + λ·MSE(z_pred, z_q_tgt)
+
+# Frozen VQ-VAE (Phase 1 output)
+vqvae:
+  checkpoint: "checkpoints/vqvae/best_model.pt"
+  config: "config/vqvae_config.yaml"
+
+# Model architecture
+model:
+  latent_channels: 64       # Must match VQ-VAE latent_dim (see vqvae_config.yaml)
+  latent_time_steps: 5512   # 88200 samples / 16 (encoder stride) — for docs only;
+                            # model is Conv1d so it handles any sequence length
+  hidden_dim: 256           # Reduced from 512 to fit Apple Silicon MPS memory
+  num_layers: 6
+  midi_embed_dim: 128
+  velocity_embed_dim: 64
+  use_residual: true        # Residual path helps preserve timbre from source
+  dropout: 0.1
+  use_multi_sample: false   # Single-sample conditioning (Phase 2)
+
+# Data — same JSON splits as VQ-VAE training
+data:
+  train_path: "data/vqvae_piano/train.json"
+  val_path:   "data/vqvae_piano/val.json"
+
+# Training
+training:
+  num_epochs: 100
+  batch_size: 4             # MPS-safe (latent shape [4, 64, 5512])
+  learning_rate: 1.0e-4
+  min_learning_rate: 1.0e-6
+  weight_decay: 0.01
+  grad_clip: 1.0
+  num_workers: 0            # Must be 0 on macOS MPS (fork deadlock)
+  save_every: 10
+  checkpoint_dir: "checkpoints/latent_transformer_vqvae"
+
+  # Audio / latent dimensions (must match VQ-VAE training)
+  sample_rate: 44100
+  duration: 2.0             # Seconds
+
+  # Loss weights
+  audio_weight: 0.1         # MultiResSTFT + Mel + time-domain L1 (weak signal through frozen decoder)
+  latent_weight: 1.0        # MSE(z_pred, z_q_target) — direct gradient to transformer

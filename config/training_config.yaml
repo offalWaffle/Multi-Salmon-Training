@@ -1,0 +1,33 @@
+training:
+  batch_size: 16  # Adjusted for Apple Silicon memory
+  num_epochs: 500
+  learning_rate: 1e-4
+  num_workers: 4
+
+  gradient_accumulation_steps: 4  # Effective batch size 64
+
+  optimizer: "AdamW"
+  scheduler: "cosine"
+  warmup_steps: 1000
+
+  checkpoint_interval: 50
+  validation_interval: 1
+
+  # Unconditional training mode (for debugging/testing)
+  # Set to true to train without conditioning (no MIDI, velocity, or input sample conditioning)
+  unconditional: false  # Back to conditional (unconditional test showed both fail equally)
+
+  # Classifier-Free Guidance (CFG) training
+  # Randomly drop conditioning during training to enable CFG during sampling
+  cfg_dropout_prob: 0.1
+
+  # CFG guidance scale for sampling (1.0 = no guidance, 3-7 = typical, higher = stronger)
+  cfg_guidance_scale: 5.0
+
+device: "mps"  # Metal Performance Shaders for Apple Silicon
+mixed_precision: false  # MPS has limited FP16 support currently
+
+data:
+  train_split: 0.9
+  val_split: 0.1
+  random_seed: 42

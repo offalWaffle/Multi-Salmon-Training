@@ -1,0 +1,88 @@
+# VQ-VAE Configuration for Piano One-Shot Generation
+
+# Model Architecture
+model:
+  in_channels: 1  # Mono audio
+  hidden_dim: 64   # Reduced from 128 to fit MPS memory with batch_size=8
+  latent_dim: 64  # Latent code dimension
+  num_layers: 4  # Number of encoder/decoder layers (downsampling factor = 2^4 = 16)
+  pitch_embed_dim: 128  # Pitch conditioning embedding dimension
+
+  # Vector Quantizer
+  num_embeddings: 512  # Codebook size
+  commitment_cost: 0.25  # Weight for commitment loss
+  use_ema: false  # EMA collapses too fast on small datasets; use gradient-based VQ
+
+# Audio Processing
+audio:
+  sample_rate: 44100
+  duration: 2.0  # Seconds (reduced from 4.0 to fit MPS memory)
+  n_fft: 2048
+  hop_length: 512
+  win_length: 2048
+
+# Training
+training:
+  batch_size: 4
+  learning_rate: 0.0003
+  num_epochs: 50
+  gradient_clip: 1.0
+
+  # Loss weights
+  reconstruction_weight: 1.0
+  vq_weight: 1.0
+  spectral_weight: 1.0
+  perceptual_weight: 0.0  # Disentanglement loss — enable after phase 1 validates
+
+  # Optimizer
+  optimizer: adam
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+
+  # Learning rate schedule
+  lr_schedule: cosine
+  warmup_epochs: 10
+  min_lr: 0.00001
+
+# Validation
+validation:
+  every_n_epochs: 5
+  num_samples: 10  # Number of reconstruction samples to save
+
+# Checkpointing
+checkpoint:
+  save_every_n_epochs: 10
+  keep_last_n: 5
+  save_best: true  # Save best model based on validation loss
+
+# Logging
+logging:
+  use_wandb: false  # Set to true to enable Weights & Biases
+  project_name: "vqvae-oneshot"
+  log_every_n_steps: 50
+  log_audio: true
+  log_spectrograms: true
+
+# Data
+data:
+  train_path: "data/vqvae_piano/train.json"
+  val_path: "data/vqvae_piano/val.json"
+  test_path: "data/vqvae_piano/test.json"
+  num_workers: 0  # >0 causes deadlocks with MPS on macOS
+  pin_memory: false  # pin_memory has no benefit on MPS
+
+# Adversarial Pitch Disentanglement
+# Forces z_q to be pitch-invariant via gradient reversal.
+# Key diagnostic: after training, pitch classifier accuracy on frozen encoder
+# should be near chance (1/88 ≈ 1.1%). If still >50%, increase lambda or alpha.
+adversarial:
+  enabled: true
+  lambda: 0.1              # Adversarial loss weight — start small, tune 0.05–1.0
+  alpha_warmup_epochs: 10  # Ramp GRL alpha from 0 → 1 over first N epochs
+  classifier_lr: 1.0e-3    # Classifier can use a higher LR than the main model
+
+# Success Criteria (Phase 1)
+success_criteria:
+  min_reconstruction_sdr: 10.0  # dB
+  min_pitch_accuracy: 0.70  # 70% baseline
+  min_codebook_perplexity: 100.0

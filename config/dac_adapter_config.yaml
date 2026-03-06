@@ -1,0 +1,36 @@
+model:
+  inner_dim: 256
+  num_residual_blocks: 3
+  pitch_embed_dim: 128
+  dac_latent_dim: 1024
+  dac_model_type: "44khz"
+
+audio:
+  sample_rate: 44100
+  duration: 1.5  # 2.0 → OOM on MPS with DAC decoder; 1.5s = 129 latent frames
+
+training:
+  batch_size: 4  # 8 → OOM on MPS (DAC decoder snake activation ~258 MB at bs=8)
+  learning_rate: 3.0e-4
+  min_lr: 1.0e-6
+  num_epochs: 100
+  reconstruction_weight: 1.0
+  gradient_clip: 1.0
+
+adversarial:
+  enabled: true
+  lambda: 0.1
+  alpha_warmup_epochs: 10
+  classifier_lr: 1.0e-3
+
+data:
+  latent_dir: data/processed_latents
+  audio_dir: data/processed
+  num_workers: 0
+  pin_memory: false
+
+checkpoint:
+  save_every_n_epochs: 10
+
+checkpoint_dir: checkpoints/dac_adapter
+log_dir: logs/dac_adapter

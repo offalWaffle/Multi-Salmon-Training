@@ -1,0 +1,15 @@
+/data/
+checkpoints/
+outputs/
+output/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+archive/
+logs/
+wandb/
+.DS_Store
+.idea/
+.venv/
+*.ipynb_checkpoints/
