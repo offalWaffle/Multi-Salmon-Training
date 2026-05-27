@@ -17,7 +17,7 @@ import torch
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.data.dac_latent_dataset import create_dataloader
+from src.data.dac_latent_dataset import create_pair_dataloader
 from src.models.conditioned_dac import load_pretrained_dac
 from src.training.dac_adapter_trainer import DACAdapterTrainer
 
@@ -67,8 +67,11 @@ def main():
     data_cfg = config['data']
     latent_dir = Path(data_cfg['latent_dir'])
 
+    include_identity = data_cfg.get('include_identity_pairs', True)
+    identity_ratio   = data_cfg.get('identity_ratio', 0.1)
+
     print("\nCreating dataloaders...")
-    train_loader = create_dataloader(
+    train_loader = create_pair_dataloader(
         latent_dir=latent_dir / 'train',
         batch_size=config['training']['batch_size'],
         duration=config['audio']['duration'],
@@ -77,8 +80,10 @@ def main():
         num_workers=data_cfg['num_workers'],
         shuffle=True,
         pin_memory=data_cfg.get('pin_memory', False),
+        include_identity=include_identity,
+        identity_ratio=identity_ratio,
     )
-    val_loader = create_dataloader(
+    val_loader = create_pair_dataloader(
         latent_dir=latent_dir / 'val',
         batch_size=config['training']['batch_size'],
         duration=config['audio']['duration'],
@@ -87,6 +92,8 @@ def main():
         num_workers=data_cfg['num_workers'],
         shuffle=False,
         pin_memory=data_cfg.get('pin_memory', False),
+        include_identity=include_identity,
+        identity_ratio=identity_ratio,
     )
 
     print(f"  Train batches: {len(train_loader)}")

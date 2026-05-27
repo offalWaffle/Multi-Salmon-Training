@@ -1,33 +1,36 @@
 model:
-  inner_dim: 256
-  num_residual_blocks: 3
-  pitch_embed_dim: 128
+  inner_dim: 512
+  num_residual_blocks: 6
+  pitch_embed_dim: 256
   dac_latent_dim: 1024
   dac_model_type: "44khz"
 
 audio:
   sample_rate: 44100
-  duration: 1.5  # 2.0 → OOM on MPS with DAC decoder; 1.5s = 129 latent frames
+  duration: 2.0  # DAC decoder no longer in training loop, so OOM is not an issue
 
 training:
-  batch_size: 4  # 8 → OOM on MPS (DAC decoder snake activation ~258 MB at bs=8)
+  batch_size: 16  # DAC decoder removed from gradient path; memory is now latent-only
   learning_rate: 3.0e-4
   min_lr: 1.0e-6
   num_epochs: 100
   reconstruction_weight: 1.0
   gradient_clip: 1.0
+  pitch_probe_weight: 0.4   # auxiliary pitch classification loss weight
+  magnitude_loss_weight: 0.1  # weight on log-magnitude term relative to cosine direction
+
+midi_offset: 21  # MIDI note 21 (A0) = class 0 for the pitch probe
 
 adversarial:
-  enabled: true
-  lambda: 0.1
-  alpha_warmup_epochs: 10
-  classifier_lr: 1.0e-3
+  enabled: false
 
 data:
-  latent_dir: data/processed_latents
-  audio_dir: data/processed
+  latent_dir: data/vst_latents
+  audio_dir: data/vst_piano
   num_workers: 0
   pin_memory: false
+  include_identity_pairs: true   # add src==tgt "do nothing" pairs so injector sees identity
+  identity_ratio: 0.1            # ~10% of pairs are identity
 
 checkpoint:
   save_every_n_epochs: 10
