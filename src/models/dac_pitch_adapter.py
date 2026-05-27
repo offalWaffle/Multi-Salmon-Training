@@ -1,14 +1,15 @@
 """
-DAC Pitch Adapter — train two small networks inside DAC's frozen latent space.
+DAC Pitch Adapter — pitch translation in frozen DAC latent space.
 
 Architecture:
     audio → [frozen DAC encoder] → z_dac
-        z_dac → [PitchStripper] → z_timbre  (adversarially forced to be pitch-free)
-        z_timbre + target_pitch → [PitchInjector FiLM] → z_modified
+        z_dac → [PitchStripper] → z_timbre  (stays near-identity; no adversarial)
+        z_timbre + src_midi + tgt_midi → [PitchInjector FiLM] → z_modified
         z_modified → [frozen DAC decoder] → audio_out
 
-Both adapters are residual with zero-init output → identity at initialisation,
-so epoch-0 reconstruction equals DAC's native quality.
+The injector is conditioned on BOTH source and target MIDI notes because the
+latent-space pitch transformation is not interval-invariant: a C2→C3 shift
+looks nothing like a C6→C7 shift in DAC's representation.
 """
 
 import torch
@@ -46,87 +47,107 @@ class ResBlock1d(nn.Module):
 
 class PitchStripper(nn.Module):
     """
-    Residual pitch-removal network.
-
-    z_timbre = z_dac − pitch_delta,  where pitch_delta is predicted from z_dac.
-    Zero-init on proj_out ensures the network starts as the identity.
-
-    x_inner (output of proj_in, before residual blocks) is returned so the
-    caller can attach GRL + PitchClassifier there.
+    Residual network — stays near-identity (no adversarial pressure).
+    Kept in the pipeline for architectural symmetry; effectively passes
+    z_dac through unchanged.
     """
 
-    def __init__(self, dac_latent_dim=1024, inner_dim=256, num_residual_blocks=3):
+    def __init__(self, dac_latent_dim=1024, inner_dim=512, num_residual_blocks=6):
         super().__init__()
-        self.proj_in = nn.Conv1d(dac_latent_dim, inner_dim, 1)
-        self.blocks = nn.Sequential(
+        self.proj_in  = nn.Conv1d(dac_latent_dim, inner_dim, 1)
+        self.blocks   = nn.Sequential(
             *[ResBlock1d(inner_dim) for _ in range(num_residual_blocks)]
         )
         self.proj_out = nn.Conv1d(inner_dim, dac_latent_dim, 1)
 
-        # Zero-init: at t=0, proj_out(x) = 0 → tanh(0)*0.1 = 0 → z_timbre = z_dac
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
 
     def forward(self, z_dac):
-        """
-        Args:
-            z_dac: [B, 1024, T]
-
-        Returns:
-            z_timbre: [B, 1024, T]
-            x_inner:  [B, inner_dim, T]  — hook point for GRL + classifier
-        """
-        x_inner = self.proj_in(z_dac)          # [B, 256, T]
-        x = self.blocks(x_inner)               # [B, 256, T]
-        pitch_delta = torch.tanh(self.proj_out(x)) * 0.1
+        x = self.proj_in(z_dac)
+        x = self.blocks(x)
+        pitch_delta = torch.tanh(self.proj_out(x)) * 1.0
         z_timbre = z_dac - pitch_delta
-        return z_timbre, x_inner
+        return z_timbre, None   # None: x_inner no longer needed
 
 
 # ---------------------------------------------------------------------------
 # PitchInjector
 # ---------------------------------------------------------------------------
 
+class PitchProbe(nn.Module):
+    """
+    Lightweight pitch classifier on z_modified.
+
+    Global-average-pool the latent → linear → 88 MIDI class logits.
+    Provides a direct gradient signal that forces the injector to encode
+    target pitch information (no DAC decoder needed).
+    """
+    def __init__(self, dac_latent_dim=1024, num_classes=88):
+        super().__init__()
+        self.linear = nn.Linear(dac_latent_dim, num_classes)
+
+    def forward(self, z):
+        # z: [B, dac_latent_dim, T]
+        return self.linear(z.mean(-1))   # [B, num_classes]
+
+
 class PitchInjector(nn.Module):
     """
-    FiLM-conditioned pitch-injection network.
+    FiLM-conditioned pitch-translation network.
 
-    z_modified = z_timbre + pitch_delta,  where pitch_delta is predicted from
-    z_timbre conditioned on target_midi.
-    Zero-init on proj_out ensures the network starts as the identity.
+    Conditioned on BOTH src_midi and tgt_midi so the network can account for
+    the register-dependent acoustic structure of the source latent.
+
+    Uses exponentially increasing dilations [1,2,4,8,16,32] across blocks to
+    give a receptive field of ~132/172 frames — wide enough to see the global
+    pitch period structure of the 2 s window.
+
+    z_modified = z_timbre + pitch_delta(z_timbre, src_midi, tgt_midi)
+    Zero-init on proj_out → identity at initialisation.
     """
 
-    def __init__(self, dac_latent_dim=1024, inner_dim=256,
-                 num_residual_blocks=3, pitch_embed_dim=128):
+    # Dilation schedule: doubles each block, giving wide temporal context
+    DILATIONS = [1, 2, 4, 8, 16, 32]
+
+    def __init__(self, dac_latent_dim=1024, inner_dim=512,
+                 num_residual_blocks=6, pitch_embed_dim=256):
         super().__init__()
-        self.pitch_embed = SinusoidalPitchEmbedding(embed_dim=pitch_embed_dim)
-        self.proj_in = nn.Conv1d(dac_latent_dim, inner_dim, 1)
+        self.src_embed = SinusoidalPitchEmbedding(embed_dim=pitch_embed_dim)
+        self.tgt_embed = SinusoidalPitchEmbedding(embed_dim=pitch_embed_dim)
+        cond_dim = pitch_embed_dim * 2          # concatenated src + tgt embeddings
+        self.proj_in  = nn.Conv1d(dac_latent_dim, inner_dim, 1)
+
+        dilations = self.DILATIONS
+        # Cycle the dilation list if num_residual_blocks > len(DILATIONS)
+        dilations = [dilations[i % len(dilations)] for i in range(num_residual_blocks)]
         self.blocks = nn.ModuleList([
-            FiLMResBlock(inner_dim, cond_dim=pitch_embed_dim)
-            for _ in range(num_residual_blocks)
+            FiLMResBlock(inner_dim, cond_dim=cond_dim, dilation=d)
+            for d in dilations
         ])
         self.proj_out = nn.Conv1d(inner_dim, dac_latent_dim, 1)
 
-        # Zero-init → identity at t=0
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
 
-    def forward(self, z_timbre, target_midi):
+    def forward(self, z_timbre, src_midi, tgt_midi):
         """
         Args:
-            z_timbre:    [B, 1024, T]
-            target_midi: [B] MIDI note numbers
+            z_timbre:  [B, 1024, T]
+            src_midi:  [B] — MIDI note of the source latent
+            tgt_midi:  [B] — MIDI note to translate to
 
         Returns:
             z_modified: [B, 1024, T]
         """
-        pitch_emb = self.pitch_embed(target_midi)   # [B, pitch_embed_dim]
-        x = self.proj_in(z_timbre)                  # [B, 256, T]
+        src_emb   = self.src_embed(src_midi)                    # [B, pitch_embed_dim]
+        tgt_emb   = self.tgt_embed(tgt_midi)                    # [B, pitch_embed_dim]
+        pitch_cond = torch.cat([src_emb, tgt_emb], dim=-1)     # [B, pitch_embed_dim*2]
+        x = self.proj_in(z_timbre)
         for block in self.blocks:
-            x = block(x, pitch_emb)
-        pitch_delta = torch.tanh(self.proj_out(x)) * 0.1
-        z_modified = z_timbre + pitch_delta
-        return z_modified
+            x = block(x, pitch_cond)
+        pitch_delta = self.proj_out(x)      # unbounded — L1 loss bounds magnitude
+        return z_timbre + pitch_delta
 
 
 # ---------------------------------------------------------------------------
@@ -136,16 +157,13 @@ class PitchInjector(nn.Module):
 class DACPitchAdapter(nn.Module):
     """
     Wraps frozen DAC encoder+decoder with trainable PitchStripper and PitchInjector.
-
-    Only PitchStripper and PitchInjector parameters are trained.
-    DAC remains completely frozen.
+    Only adapter parameters are trained; DAC remains frozen.
     """
 
-    def __init__(self, dac_model, inner_dim=256, num_residual_blocks=3,
-                 pitch_embed_dim=128, dac_latent_dim=1024):
+    def __init__(self, dac_model, inner_dim=512, num_residual_blocks=6,
+                 pitch_embed_dim=256, dac_latent_dim=1024):
         super().__init__()
 
-        # Freeze DAC
         self.dac = dac_model
         for p in self.dac.parameters():
             p.requires_grad_(False)
@@ -153,84 +171,44 @@ class DACPitchAdapter(nn.Module):
         self.stripper = PitchStripper(dac_latent_dim, inner_dim, num_residual_blocks)
         self.injector = PitchInjector(dac_latent_dim, inner_dim, num_residual_blocks,
                                       pitch_embed_dim)
-
-    def strip_pitch(self, z_dac):
-        """
-        Args:
-            z_dac: [B, 1024, T]
-
-        Returns:
-            z_timbre: [B, 1024, T]
-            x_inner:  [B, inner_dim, T]
-        """
-        return self.stripper(z_dac)
-
-    def inject_pitch(self, z_timbre, target_midi):
-        """
-        Args:
-            z_timbre:    [B, 1024, T]
-            target_midi: [B]
-
-        Returns:
-            z_modified: [B, 1024, T]
-        """
-        return self.injector(z_timbre, target_midi)
+        self.probe    = PitchProbe(dac_latent_dim, num_classes=88)
 
     def forward(self, z_dac, src_midi, tgt_midi):
-        """
-        Full adapter pipeline (training forward pass).
-
-        Strips src pitch, injects tgt pitch.  For reconstruction training,
-        call with src_midi == tgt_midi.
-
-        Args:
-            z_dac:    [B, 1024, T]
-            src_midi: [B]  (unused in current residual design but kept for API symmetry)
-            tgt_midi: [B]
-
-        Returns:
-            z_modified: [B, 1024, T]
-            x_inner:    [B, inner_dim, T]  — for GRL + adversarial loss
-            z_timbre:   [B, 1024, T]
-        """
-        z_timbre, x_inner = self.stripper(z_dac)
-        z_modified = self.injector(z_timbre, tgt_midi)
-        return z_modified, x_inner, z_timbre
+        z_timbre, _ = self.stripper(z_dac)
+        z_modified  = self.injector(z_timbre, src_midi, tgt_midi)
+        return z_modified, z_timbre
 
     @torch.no_grad()
-    def transfer_pitch(self, audio, target_midi_note):
+    def transfer_pitch(self, audio, src_midi_note, target_midi_note):
         """
-        One-shot inference: encode, strip, inject new pitch, decode.
+        One-shot inference: encode, translate pitch, decode.
 
         Args:
             audio:            [B, 1, samples] input audio (44.1 kHz)
-            target_midi_note: int or [B] tensor — MIDI note(s) for output
+            src_midi_note:    int or [B] — MIDI note of the source audio
+            target_midi_note: int or [B] — desired output MIDI note
 
         Returns:
             audio_out: [B, 1, samples'] reconstructed audio at new pitch
         """
         self.eval()
 
-        # Encode with frozen DAC
         z_dac, _codes, _latents, _cl, _ql = self.dac.encode(audio)
-
-        # Strip pitch
         z_timbre, _ = self.stripper(z_dac)
 
-        # Build target midi tensor
-        if isinstance(target_midi_note, int):
-            tgt = torch.full((audio.shape[0],), target_midi_note,
-                             dtype=torch.long, device=audio.device)
-        else:
-            tgt = target_midi_note.to(audio.device)
+        def _to_tensor(note, B, device):
+            if isinstance(note, int):
+                return torch.full((B,), note, dtype=torch.long, device=device)
+            return note.to(device)
 
-        # Inject new pitch
-        z_modified = self.injector(z_timbre, tgt)
+        B, device = audio.shape[0], audio.device
+        src = _to_tensor(src_midi_note, B, device)
+        tgt = _to_tensor(target_midi_note, B, device)
 
-        # Decode with frozen DAC
-        audio_out = self.dac.decode(z_modified)
-        return audio_out
+        z_modified = self.injector(z_timbre, src, tgt)
+        return self.dac.decode(z_modified)
 
     def adapter_parameters(self):
-        """Return only the trainable adapter parameters (for main optimizer)."""
-        return list(self.stripper.parameters()) + list(self.injector.parameters())
+        return (list(self.stripper.parameters()) +
+                list(self.injector.parameters()) +
+                list(self.probe.parameters()))
