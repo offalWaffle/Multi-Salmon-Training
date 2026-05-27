@@ -45,6 +45,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Generate instrument with DAC Pitch Adapter')
     parser.add_argument('--source', type=str, required=True,
                         help='Source audio file (WAV/FLAC)')
+    parser.add_argument('--source-midi', type=int, required=True,
+                        help='MIDI note number of the source audio (e.g. 60 for C4)')
     parser.add_argument('--checkpoint', type=str,
                         default='checkpoints/dac_adapter/best_model.pt',
                         help='Trained adapter checkpoint')
@@ -59,6 +61,12 @@ def parse_args():
                         help='Output directory for WAV files')
     parser.add_argument('--sfz', action='store_true',
                         help='Export SFZ instrument manifest')
+    parser.add_argument('--requantize', action='store_true',
+                        help='Snap injector output back onto DAC RVQ codebook manifold before decoding')
+    parser.add_argument('--env-from-source', action='store_true', dest='env_from_source',
+                        help='Renormalize injector output per-frame so amplitude envelope is inherited from the source')
+    parser.add_argument('--diag', action='store_true',
+                        help='Also write diagnostic WAVs: roundtrip.wav (decode source latents only) and identity.wav (injector with tgt=src)')
     parser.add_argument('--device', type=str, default=None)
     return parser.parse_args()
 
@@ -75,11 +83,12 @@ def get_device(device_arg=None):
 
 def load_audio(path, target_sr=44100, device='cpu'):
     """Load audio file, resample to target_sr, convert to mono [1, 1, N]."""
-    audio, sr = torchaudio.load(path)
+    data, sr = sf.read(str(path), always_2d=True)   # [N, channels]
+    audio = torch.from_numpy(data.T).float()         # [channels, N]
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)      # mono [1, N]
     if sr != target_sr:
         audio = torchaudio.functional.resample(audio, sr, target_sr)
-    if audio.shape[0] > 1:
-        audio = audio.mean(dim=0, keepdim=True)
     # DAC expects [batch, 1, samples]
     return audio.unsqueeze(0).to(device)
 
@@ -124,11 +133,14 @@ def main():
     print("\n" + "="*70)
     print("DAC PITCH ADAPTER — INSTRUMENT GENERATION")
     print("="*70)
-    print(f"Source:     {args.source}")
+    print(f"Source:     {args.source}  (MIDI {args.source_midi})")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"MIDI range: {args.midi_low}–{args.midi_high}")
     print(f"Output:     {out_dir}")
     print(f"Device:     {device}")
+    print(f"Requantize: {args.requantize}")
+    print(f"EnvFromSrc: {args.env_from_source}")
+    print(f"Diag:       {args.diag}")
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -149,6 +161,8 @@ def main():
     audio = load_audio(args.source, target_sr=config['audio']['sample_rate'], device=device)
 
     # DAC encode once
+    src_midi_t = torch.tensor([args.source_midi], dtype=torch.long, device=device)
+
     with torch.no_grad():
         z_dac, _codes, _latents, _cl, _ql = dac_model.encode(audio)
         z_timbre, _ = adapter.stripper(z_dac)
@@ -157,12 +171,41 @@ def main():
 
     # Generate one WAV per MIDI note
     sr = config['audio']['sample_rate']
+
+    def save_wav(z_decode_input, path):
+        with torch.no_grad():
+            audio_out = dac_model.decode(z_decode_input)
+        wav = audio_out[0, 0].cpu().float().numpy()
+        peak = np.abs(wav).max()
+        if peak > 0:
+            wav = wav / peak * 0.95
+        sf.write(str(path), wav, sr)
+
+    if args.diag:
+        print("\nWriting diagnostic WAVs...")
+        # Decode source latents directly — tests DAC encode/decode roundtrip with no adapter
+        save_wav(z_dac, out_dir / 'diag_roundtrip.wav')
+        print(f"  diag_roundtrip.wav (no adapter)")
+        # Injector with tgt = src — tests whether the adapter adds buzz even when not changing pitch
+        with torch.no_grad():
+            z_identity = adapter.injector(z_timbre, src_midi_t, src_midi_t)
+        save_wav(z_identity, out_dir / 'diag_identity.wav')
+        print(f"  diag_identity.wav (injector with tgt=src)")
+
     print(f"\nGenerating MIDI {args.midi_low}–{args.midi_high}...")
 
+    eps = 1e-8
     for midi_note in range(args.midi_low, args.midi_high + 1):
         with torch.no_grad():
             tgt = torch.tensor([midi_note], dtype=torch.long, device=device)
-            z_modified = adapter.injector(z_timbre, tgt)
+            z_modified = adapter.injector(z_timbre, src_midi_t, tgt)
+            if args.env_from_source:
+                # Replace per-frame magnitude with source's; keep injector's direction
+                n_src = z_timbre.norm(dim=1, keepdim=True)
+                n_mod = z_modified.norm(dim=1, keepdim=True)
+                z_modified = z_modified * (n_src / (n_mod + eps))
+            if args.requantize:
+                z_modified, *_ = dac_model.quantizer(z_modified)
             audio_out = dac_model.decode(z_modified)   # [1, 1, T]
 
         # Convert to numpy and save
