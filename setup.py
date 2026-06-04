@@ -18,6 +18,7 @@ setup(
         "matplotlib>=3.7.0",
         "wandb>=0.15.0",
         "einops>=0.7.0",
+        "descript-audio-codec>=1.0.0",
         "omegaconf>=2.3.0",
         "sf2utils>=0.9.0",
     ],
