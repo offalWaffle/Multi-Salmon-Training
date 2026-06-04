@@ -16,7 +16,7 @@ training:
   num_epochs: 100
   reconstruction_weight: 1.0
   gradient_clip: 1.0
-  pitch_probe_weight: 0.4   # auxiliary pitch classification loss weight
+  pitch_probe_weight: 0.0   # auxiliary pitch classification loss weight
   magnitude_loss_weight: 0.1  # weight on log-magnitude term relative to cosine direction
 
 midi_offset: 21  # MIDI note 21 (A0) = class 0 for the pitch probe
