@@ -1,7 +1,8 @@
-"""Training loops."""
+"""Training loops (active DAC pitch-adapter path).
 
-from .vqvae_trainer import VQVAETrainer
-from .transformer_trainer import LatentTransformerTrainer
+VQ-VAE / latent-transformer trainers live in legacy/ — see legacy/README.md.
+"""
+
 from .dac_adapter_trainer import DACAdapterTrainer
 
-__all__ = ['VQVAETrainer', 'LatentTransformerTrainer', 'DACAdapterTrainer']
+__all__ = ['DACAdapterTrainer']

@@ -1,20 +1,17 @@
-"""Model architectures."""
+"""Model architectures (active DAC pitch-adapter path).
+
+Earlier VQ-VAE / latent-transformer / adversarial models live in legacy/ — see
+legacy/README.md and root README §8.
+"""
 
 from .conditioned_dac import ConditionedDAC, FiLMConditionedDAC, create_conditioned_dac, load_pretrained_dac
-from .dac_pitch_adapter import DACPitchAdapter, PitchStripper, PitchInjector
+from .dac_pitch_adapter import DACPitchAdapter, PitchStripper, PitchInjector, PitchProbe
 from .film_layers import FiLM, FiLMConv1d, FiLMResBlock
 from .pitch_conditioning import SinusoidalPitchEmbedding, PitchEmbedding
-from .pitch_adversary import GradientReversal, PitchClassifier
-from .vqvae import VQVAE
-from .quantizers import VectorQuantizer
-from .latent_transformer import LatentTransformer
 
 __all__ = [
     'ConditionedDAC', 'FiLMConditionedDAC', 'create_conditioned_dac', 'load_pretrained_dac',
-    'DACPitchAdapter', 'PitchStripper', 'PitchInjector',
+    'DACPitchAdapter', 'PitchStripper', 'PitchInjector', 'PitchProbe',
     'FiLM', 'FiLMConv1d', 'FiLMResBlock',
     'SinusoidalPitchEmbedding', 'PitchEmbedding',
-    'GradientReversal', 'PitchClassifier',
-    'VQVAE', 'VectorQuantizer',
-    'LatentTransformer',
 ]

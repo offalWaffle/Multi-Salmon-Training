@@ -15,8 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .quantizers import VectorQuantizer, EMAVectorQuantizer
-from .film_layers import FiLMConv1d, FiLMResBlock
-from .pitch_conditioning import SinusoidalPitchEmbedding
+# film_layers / pitch_conditioning stay in the active package (shared building blocks)
+from src.models.film_layers import FiLMConv1d, FiLMResBlock
+from src.models.pitch_conditioning import SinusoidalPitchEmbedding
 
 
 class Encoder(nn.Module):

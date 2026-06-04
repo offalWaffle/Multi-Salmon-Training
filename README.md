@@ -10,6 +10,39 @@ points to the design doc that owns the detail.
 
 ---
 
+## Status & results
+
+**Working end-to-end.** A trained adapter takes one piano note and renders a playable 88-key
+instrument with the source timbre preserved across the range.
+
+| | |
+|---|---|
+| Best validation loss | **0.323** (cosine-direction + log-magnitude, see §3) at epoch 97 |
+| Trainable params | **~27.3M** (stripper + injector); the DAC codec stays frozen |
+| Training data | 1,896 train / 216 val DAC latents — 8 piano types × 3 velocities × 88 notes |
+| Train cost | a single mid-range GPU (RTX 3090/4090), well under an hour |
+| Hardware | develops on Apple Silicon (MPS); trains on CUDA via the `cloud/` pipeline |
+
+**Hear it for yourself** (artifacts are gitignored, so regenerate locally):
+
+```bash
+python scripts/generate_instrument_dac.py \
+    --source <one_note.wav> --source-midi 60 \
+    --checkpoint checkpoints/dac_adapter/best_model.pt \
+    --midi-low 21 --midi-high 108 --out-dir output/demo --sfz --diag
+```
+
+This writes one WAV per key (`output/demo/note_021_A0.wav` … `note_108_C8.wav`), an SFZ you can
+load in any sampler, plus `--diag` reference files that isolate codec roundtrip vs. adapter
+artefacts. See §5 for the meaning of every flag.
+
+> This project deliberately keeps its **full research history** in the repo — including the
+> approaches that *failed* and why (§8, [`legacy/`](legacy/)). The path to the working model
+> (abandoning adversarial disentanglement, killing a hidden noise floor, fixing a decay "buzz")
+> is the most informative part; it isn't hidden.
+
+---
+
 ## 1. What this project does
 
 **Goal:** take one recorded/synthesised note (e.g. a piano C4) and produce a playable,
@@ -247,42 +280,43 @@ ships CUDA builds; reinstalling from PyPI can silently swap in a CPU-only build)
 
 ## 7. Repository map
 
+The active system lives entirely in `src/` + `scripts/` + `cloud/`. Everything from earlier
+abandoned approaches has been moved under `legacy/` so the active path is unambiguous.
+
 ```
 config/
-  dac_adapter_config.yaml      ← ACTIVE config (model dims, training, data, checkpoint paths)
+  dac_adapter_config.yaml      the ACTIVE config (model dims, training, data, checkpoint paths)
   dac_latent_stats.yaml        latent normalisation stats
-  vqvae_config.yaml, latent_transformer_config.yaml, data_prep_config.json   (legacy approaches)
-src/
+src/                           ← ACTIVE: the DAC pitch-adapter system, and only that
   models/
-    dac_pitch_adapter.py       ← ACTIVE: PitchStripper, PitchInjector, PitchProbe, DACPitchAdapter
-    conditioned_dac.py         ← load_pretrained_dac(); ConditionedDAC wrappers (legacy)
-    film_layers.py             FiLM / FiLMResBlock building blocks
-    pitch_conditioning.py      SinusoidalPitchEmbedding etc.
-    vqvae.py, quantizers.py, latent_transformer.py, pitch_adversary.py   (legacy)
+    dac_pitch_adapter.py         PitchStripper, PitchInjector, PitchProbe, DACPitchAdapter
+    conditioned_dac.py           load_pretrained_dac(); ConditionedDAC decode-time wrappers (unused by adapter)
+    film_layers.py               FiLM / FiLMResBlock building blocks
+    pitch_conditioning.py        SinusoidalPitchEmbedding etc.
   data/
-    dac_latent_dataset.py      ← ACTIVE: DACPitchPairDataset + create_pair_dataloader
-    vqvae_dataset.py, transformer_dataset.py, sfz_parser.py, audio_utils.py
+    dac_latent_dataset.py        DACPitchPairDataset + create_pair_dataloader
+    audio_utils.py, sfz_parser.py   generic audio / SFZ helpers
   training/
-    dac_adapter_trainer.py     ← ACTIVE: DACAdapterTrainer + cosine/magnitude loss
-    vqvae_trainer.py, transformer_trainer.py   (legacy)
-  losses/                      disentanglement / perceptual / spectral losses (mostly legacy)
-scripts/
-  prepare_vst_piano.py         ← ACTIVE data prep (WAV → .pt + split)
-  precompute_dac_latents.py    ← ACTIVE (audio .pt → latent .pt)
-  train_dac_adapter.py         ← ACTIVE training entry point
-  generate_instrument_dac.py   ← ACTIVE inference / instrument export
-  analyze_latent_pitch_correlation.py, test_dac_reconstruction.py, diagnose_audio_quality.py
-  (+ many prepare_*/train_*/evaluate_* scripts from earlier approaches)
-cloud/                         vast.ai + B2 training pipeline (see §6)
+    dac_adapter_trainer.py       DACAdapterTrainer + cosine/magnitude loss
+scripts/                       ← ACTIVE entry points
+  prepare_vst_piano.py           data prep (WAV → .pt + stratified split)
+  precompute_dac_latents.py      audio .pt → latent .pt
+  train_dac_adapter.py           training entry point
+  generate_instrument_dac.py     inference / instrument export
+  analyze_latent_pitch_correlation.py   latent↔pitch diagnostic
+cloud/                         vast.ai + B2 GPU training pipeline (see §6)
 docs/                          design docs (see §9)
+legacy/                        ARCHIVED prior approaches (VQ-VAE+transformer, diffusion-era)
+                               — models/data/training/losses/config/scripts/tests + its own README
 data/                          datasets (gitignored); active: vst_piano/, vst_latents/
-checkpoints/, logs/, output/   training + generation artefacts
+checkpoints/, logs/, output/   training + generation artefacts (gitignored)
 ```
 
-**Legacy vs active:** the repo carries code from earlier abandoned approaches (a VQ-VAE +
-latent-transformer pipeline, and an adversarial-disentanglement variant). They are kept for
-reference but are **not** on the active path. When in doubt, the files marked *ACTIVE* above and
-anything named `*dac*` are the current system.
+**Legacy vs active:** the repo's earlier directions (a VQ-VAE + latent-transformer pipeline, an
+adversarial-disentanglement variant, and a still-earlier diffusion era) are archived under
+[`legacy/`](legacy/) with [`legacy/README.md`](legacy/README.md) explaining each. They are kept
+to document the project's evolution (§8) but are **not** on the active path — everything outside
+`legacy/` is the current system.
 
 ---
 
@@ -307,7 +341,7 @@ alternative was tried and failed.
 - **Adversarial disentanglement (GRL + PitchClassifier):** the classifier consistently dominated
   the stripper across all λ/α/LR settings — adversarial disentanglement of a 1024-dim continuous
   latent with a small residual net is too hard. (`docs/ADVERSARIAL_DISENTANGLEMENT_APPROACH.md`,
-  `src/models/pitch_adversary.py`.)
+  `legacy/models/pitch_adversary.py`.)
 - **Same-instrument cross-recording pairs:** acoustic variation between recordings put a hard
   floor (~2.37) under val loss. Fixed by switching to single-VST synthetic data.
 - **DAC decoder in the training loop (audio loss):** removed; latent loss is enough and much
