@@ -1,0 +1,12 @@
+# Cloud (CUDA) deps for DAC pitch-adapter training.
+#
+# IMPORTANT: torch and torchaudio are intentionally omitted. The vast.ai PyTorch
+# base image already ships a CUDA build of both; reinstalling from PyPI can replace
+# it with a CPU-only build and silently kill GPU training. descript-audio-codec
+# depends on torch/torchaudio but pip leaves the existing install alone when it
+# already satisfies the requirement.
+descript-audio-codec==1.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+tqdm>=4.65.0
+einops>=0.7.0
