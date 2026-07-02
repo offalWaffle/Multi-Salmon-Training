@@ -18,6 +18,15 @@ training:
   gradient_clip: 1.0
   pitch_probe_weight: 0.0   # auxiliary pitch classification loss weight
   magnitude_loss_weight: 0.1  # weight on log-magnitude term relative to cosine direction
+  # Multi-res STFT loss on a decoded sub-batch — restores HF detail the latent
+  # loss is blind to (fixes the low-pass blur in translated notes). Puts the DAC
+  # decoder back in the gradient path for stft_decode_subbatch samples/step, so
+  # run on a CUDA GPU (24 GB), not MPS. Set weight 0 to disable.
+  stft_loss_weight: 1.0
+  stft_decode_subbatch: 4
+  # Weight per-frame cosine-direction loss by target magnitude so near-silent
+  # decay frames (ill-defined direction) stop fitting noise → fixes tail buzz.
+  direction_tail_weighting: true
 
 midi_offset: 21  # MIDI note 21 (A0) = class 0 for the pitch probe
 

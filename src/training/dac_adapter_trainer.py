@@ -22,20 +22,61 @@ from tqdm import tqdm
 from ..models.dac_pitch_adapter import DACPitchAdapter
 
 
-def _recon_loss(z_modified, z_target, magnitude_weight=0.1, eps=1e-6):
+def _recon_loss(z_modified, z_target, magnitude_weight=0.1, tail_weighting=False, eps=1e-6):
     """Per-frame cosine direction + log-magnitude loss.
 
-    Equal gradient pressure across frames regardless of their latent magnitude —
-    forces the model to predict tail frames as accurately as attack frames.
+    With tail_weighting=False, applies equal gradient pressure across frames
+    regardless of magnitude. With tail_weighting=True, each frame's direction
+    term is weighted by the target's latent magnitude: near-silent decay frames
+    have an ill-defined direction (a ~zero vector points nowhere), so matching
+    their "direction" just fits noise and decodes as tonal buzz. Down-weighting
+    them lets the magnitude term drive those frames to ~zero (correct silence)
+    instead.
     """
     cos_sim = F.cosine_similarity(z_modified, z_target, dim=1)   # [B, T]
-    direction_loss = (1.0 - cos_sim).mean()
-    mag_mod = z_modified.norm(dim=1)                              # [B, T]
+    per_frame_dir = 1.0 - cos_sim                                # [B, T]
+    mag_mod = z_modified.norm(dim=1)                             # [B, T]
     mag_tgt = z_target.norm(dim=1)
+    if tail_weighting:
+        # Normalise weights to mean ~1 so the loss scale stays comparable to the
+        # unweighted version (and to the magnitude term).
+        w = mag_tgt.detach()
+        w = w / (w.mean() + eps)
+        direction_loss = (w * per_frame_dir).mean()
+    else:
+        direction_loss = per_frame_dir.mean()
     magnitude_loss = F.l1_loss(torch.log(mag_mod + eps),
                                torch.log(mag_tgt + eps))
     recon = direction_loss + magnitude_weight * magnitude_loss
     return recon, direction_loss, magnitude_loss
+
+
+def _multires_stft_loss(pred_audio, tgt_audio, fft_sizes=(512, 1024, 2048), eps=1e-7):
+    """Multi-resolution STFT loss: spectral convergence + log-magnitude L1.
+
+    Operates on decoded audio, so it penalises the high-frequency spectral
+    detail that the latent-space cosine/magnitude loss is blind to — the cure
+    for the regression-to-the-mean low-pass blur in translated notes.
+
+    Args:
+        pred_audio, tgt_audio: [N, samples] or [N, 1, samples]
+    """
+    if pred_audio.dim() == 3:
+        pred_audio = pred_audio.squeeze(1)
+        tgt_audio  = tgt_audio.squeeze(1)
+
+    total = 0.0
+    for n_fft in fft_sizes:
+        hop = n_fft // 4
+        win = torch.hann_window(n_fft, device=pred_audio.device)
+        S_pred = torch.stft(pred_audio, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                            window=win, return_complex=True).abs()
+        S_tgt  = torch.stft(tgt_audio,  n_fft=n_fft, hop_length=hop, win_length=n_fft,
+                            window=win, return_complex=True).abs()
+        spectral_conv = torch.norm(S_tgt - S_pred, p='fro') / (torch.norm(S_tgt, p='fro') + eps)
+        log_mag       = F.l1_loss(torch.log(S_pred + eps), torch.log(S_tgt + eps))
+        total = total + spectral_conv + log_mag
+    return total / len(fft_sizes)
 
 
 class DACAdapterTrainer:
@@ -69,6 +110,9 @@ class DACAdapterTrainer:
         self.gradient_clip     = train_cfg.get('gradient_clip', 1.0)
         self.probe_weight      = train_cfg.get('pitch_probe_weight', 0.1)
         self.magnitude_weight  = train_cfg.get('magnitude_loss_weight', 0.1)
+        self.stft_weight       = train_cfg.get('stft_loss_weight', 0.0)      # 0 = off
+        self.stft_subbatch     = train_cfg.get('stft_decode_subbatch', 4)    # samples decoded/step
+        self.tail_weighting    = train_cfg.get('direction_tail_weighting', False)
         self.midi_offset       = config.get('midi_offset', 21)  # MIDI 21 = class 0
 
         self.checkpoint_dir = Path(config.get('checkpoint_dir', 'checkpoints/dac_adapter'))
@@ -88,6 +132,7 @@ class DACAdapterTrainer:
         total_dir_loss   = 0.0
         total_mag_loss   = 0.0
         total_probe_loss = 0.0
+        total_stft_loss  = 0.0
         num_batches      = 0
         src_correct      = 0   # tracked but not printed; used to confirm src suppression
 
@@ -110,8 +155,21 @@ class DACAdapterTrainer:
             z_modified = self.adapter.injector(z_timbre, src_midi, tgt_midi)
 
             recon_loss, direction_loss, magnitude_loss = _recon_loss(
-                z_modified, tgt_latent.detach(), magnitude_weight=self.magnitude_weight
+                z_modified, tgt_latent.detach(), magnitude_weight=self.magnitude_weight,
+                tail_weighting=self.tail_weighting,
             )
+
+            # Multi-resolution STFT loss on a decoded sub-batch. Decodes only
+            # stft_subbatch samples through the frozen DAC to keep activation
+            # memory bounded; the decoded target latent is the HF ceiling.
+            if self.stft_weight > 0:
+                n = min(self.stft_subbatch, z_modified.shape[0])
+                pred_audio = self.adapter.dac.decode(z_modified[:n])
+                with torch.no_grad():
+                    tgt_audio = self.adapter.dac.decode(tgt_latent[:n])
+                stft_loss = _multires_stft_loss(pred_audio, tgt_audio)
+            else:
+                stft_loss = torch.zeros((), device=self.device)
 
             # Pitch probe — two signals:
             #   (a) target probe:       z_modified must predict tgt_midi  [pull toward target]
@@ -125,7 +183,7 @@ class DACAdapterTrainer:
             src_probe_loss = src_probs.gather(1, src_class.unsqueeze(1)).squeeze(1).mean()
             probe_loss = tgt_probe_loss + 0.5 * src_probe_loss
 
-            loss = recon_loss + self.probe_weight * probe_loss
+            loss = recon_loss + self.probe_weight * probe_loss + self.stft_weight * stft_loss
 
             if not torch.isfinite(loss):
                 print(f"\n[NaN] batch {batch_idx} loss={loss.item():.4f}")
@@ -151,12 +209,13 @@ class DACAdapterTrainer:
             total_dir_loss   += direction_loss.item()
             total_mag_loss   += magnitude_loss.item()
             total_probe_loss += probe_loss.item()
+            total_stft_loss  += stft_loss.item()
             num_batches      += 1
 
             pbar.set_postfix({
                 'dir':   f'{direction_loss.item():.4f}',
                 'mag':   f'{magnitude_loss.item():.4f}',
-                'probe': f'{tgt_probe_loss.item():.4f}',
+                'stft':  f'{stft_loss.item():.4f}',
             })
             self.global_step += 1
             self._log_step({
@@ -167,19 +226,21 @@ class DACAdapterTrainer:
                 'train/probe_loss':     probe_loss.item(),
                 'train/tgt_probe_loss': tgt_probe_loss.item(),
                 'train/src_probe_loss': src_probe_loss.item(),
+                'train/stft_loss':      stft_loss.item(),
                 'train/lr':             self.optimizer.param_groups[0]['lr'],
             })
 
         if num_batches == 0:
             return {'loss': float('nan'), 'recon_loss': float('nan'),
                     'direction_loss': float('nan'), 'magnitude_loss': float('nan'),
-                    'probe_loss': float('nan')}
+                    'probe_loss': float('nan'), 'stft_loss': float('nan')}
         return {
             'loss':           total_loss       / num_batches,
             'recon_loss':     total_recon_loss / num_batches,
             'direction_loss': total_dir_loss   / num_batches,
             'magnitude_loss': total_mag_loss   / num_batches,
             'probe_loss':     total_probe_loss / num_batches,
+            'stft_loss':      total_stft_loss  / num_batches,
         }
 
     # ------------------------------------------------------------------
@@ -195,6 +256,7 @@ class DACAdapterTrainer:
         total_dir_loss   = 0.0
         total_mag_loss   = 0.0
         total_probe_loss = 0.0
+        total_stft_loss  = 0.0
         correct          = 0
         src_correct      = 0
         total_samples    = 0
@@ -209,8 +271,17 @@ class DACAdapterTrainer:
             z_timbre, _  = self.adapter.stripper(src_latent)
             z_modified   = self.adapter.injector(z_timbre, src_midi, tgt_midi)
             recon_loss, direction_loss, magnitude_loss = _recon_loss(
-                z_modified, tgt_latent, magnitude_weight=self.magnitude_weight
+                z_modified, tgt_latent, magnitude_weight=self.magnitude_weight,
+                tail_weighting=self.tail_weighting,
             )
+
+            if self.stft_weight > 0:
+                n = min(self.stft_subbatch, z_modified.shape[0])
+                pred_audio = self.adapter.dac.decode(z_modified[:n])
+                tgt_audio  = self.adapter.dac.decode(tgt_latent[:n])
+                stft_loss  = _multires_stft_loss(pred_audio, tgt_audio)
+            else:
+                stft_loss = torch.zeros((), device=self.device)
 
             tgt_class      = (tgt_midi - self.midi_offset).long()
             src_class      = (src_midi - self.midi_offset).long()
@@ -219,7 +290,7 @@ class DACAdapterTrainer:
             src_probs      = torch.softmax(probe_logits, dim=-1)
             src_probe_loss = src_probs.gather(1, src_class.unsqueeze(1)).squeeze(1).mean()
             probe_loss     = tgt_probe_loss + 0.5 * src_probe_loss
-            loss           = recon_loss + self.probe_weight * probe_loss
+            loss           = recon_loss + self.probe_weight * probe_loss + self.stft_weight * stft_loss
 
             if not torch.isfinite(loss):
                 continue
@@ -235,18 +306,21 @@ class DACAdapterTrainer:
             total_dir_loss   += direction_loss.item()
             total_mag_loss   += magnitude_loss.item()
             total_probe_loss += probe_loss.item()
+            total_stft_loss  += stft_loss.item()
             num_batches      += 1
 
         if num_batches == 0:
             return {'loss': float('nan'), 'recon_loss': float('nan'),
                     'direction_loss': float('nan'), 'magnitude_loss': float('nan'),
-                    'probe_loss': float('nan'), 'probe_acc': 0.0, 'src_probe_acc': 0.0}
+                    'probe_loss': float('nan'), 'stft_loss': float('nan'),
+                    'probe_acc': 0.0, 'src_probe_acc': 0.0}
         return {
             'loss':           total_loss       / num_batches,
             'recon_loss':     total_recon_loss / num_batches,
             'direction_loss': total_dir_loss   / num_batches,
             'magnitude_loss': total_mag_loss   / num_batches,
             'probe_loss':     total_probe_loss / num_batches,
+            'stft_loss':      total_stft_loss  / num_batches,
             'probe_acc':      correct     / max(1, total_samples),
             'src_probe_acc':  src_correct / max(1, total_samples),
         }
@@ -281,10 +355,12 @@ class DACAdapterTrainer:
                 f"train={train_losses['loss']:.4f} "
                 f"(dir={train_losses['direction_loss']:.4f} "
                 f"mag={train_losses['magnitude_loss']:.4f} "
+                f"stft={train_losses['stft_loss']:.4f} "
                 f"probe={train_losses['probe_loss']:.4f}) | "
                 f"val={val_losses['loss']:.4f} "
                 f"(dir={val_losses['direction_loss']:.4f} "
                 f"mag={val_losses['magnitude_loss']:.4f} "
+                f"stft={val_losses['stft_loss']:.4f} "
                 f"tgt_acc={val_losses['probe_acc']*100:.1f}% "
                 f"src_acc={val_losses['src_probe_acc']*100:.1f}%)"
             )
